@@ -9,7 +9,7 @@ A lightweight CLI tool that dynamically discovers all your AWS SSO accounts and 
 - Discovers all accessible accounts and roles from your active SSO token
 - Interactive fuzzy search via `fzf`
 - Exports temporary credentials as environment variables
-- Optionally saves selected credentials as a named AWS profile
+- Always saves selected credentials as a named AWS profile (account name by default)
 - Supports multiple SSO sessions / orgs
 - Pre-filter by keyword for fast switching
 
@@ -83,7 +83,7 @@ aws sso login --sso-session prod
 ## Usage
 
 ```bash
-# Interactive account/role picker
+# Interactive account/role picker — always saves a profile named after the account
 sw
 
 # Pre-filter by keyword
@@ -97,14 +97,11 @@ sw -s staging
 # List all accessible accounts/roles without switching
 aws-sso-switch -l
 
-# Save selected credentials as an auto-named AWS profile
-sw -p
-
-# Save selected credentials as a specific named profile
+# Save selected credentials under a custom profile name
 sw -p my-prod-admin
 
 # Combine flags
-sw -s prod -f faber -p
+sw -s prod -f faber
 sw -s prod -p my-prod-admin
 
 # Show current AWS context
@@ -113,28 +110,28 @@ aws-whoami   # if installed, or: aws sts get-caller-identity
 
 ---
 
-## Saving as a Named AWS Profile (`-p`)
+## Named AWS Profile (automatic)
 
-The `-p` flag saves the selected credentials to `~/.aws/credentials` and `~/.aws/config` as a named profile, in addition to exporting them as environment variables.
+Every `sw` invocation saves credentials to `~/.aws/credentials` and `~/.aws/config` as a named profile, in addition to exporting them as environment variables.
 
-**Auto-named** (derived from account name + role name):
+**Default** — profile name is derived from the AWS account name:
 ```bash
-sw -p
-# Saves as e.g. "myaccount-adminrole"
+sw
+# Selects e.g. "faber" account → saves profile named "faber"
 ```
 
-**Custom name:**
+**Custom name** — override with `-p`:
 ```bash
 sw -p my-prod-admin
-# Saves as "my-prod-admin"
+# Saves as "my-prod-admin" regardless of account name
 ```
 
 After saving, `AWS_PROFILE` is also exported, so any tool that respects `AWS_PROFILE` will use it automatically:
 
 ```bash
-sw -p my-prod-admin
-aws s3 ls                        # uses my-prod-admin profile via AWS_PROFILE
-aws --profile my-prod-admin s3 ls  # explicit profile reference
+sw
+aws s3 ls                    # uses account-name profile via AWS_PROFILE
+aws --profile faber s3 ls    # explicit profile reference
 ```
 
 ### What gets written
@@ -157,7 +154,7 @@ x_account_id = 123456789012
 x_role_name = AdminRole
 ```
 
-> **Note:** SSO temporary credentials expire (typically ~1 hour). Re-run `sw -p` after expiry to refresh.
+> **Note:** SSO temporary credentials expire (typically ~1 hour). Re-run `sw` after expiry to refresh.
 
 ---
 
@@ -174,7 +171,7 @@ After switching, the following variables are set in your shell:
 | `AWS_ACCOUNT_ID` | Selected account ID |
 | `AWS_ACCOUNT_NAME` | Selected account name |
 | `AWS_ROLE_NAME` | Selected role name |
-| `AWS_PROFILE` | Profile name (only when `-p` is used) |
+| `AWS_PROFILE` | Profile name (account name by default, or custom via `-p`) |
 
 ---
 
@@ -198,4 +195,4 @@ After switching, the following variables are set in your shell:
 3. Presents them in `fzf` for interactive selection
 4. Calls `aws sso get-role-credentials` for the selected account/role
 5. Emits `export` statements — the `sw` wrapper runs them via `eval`
-6. Optionally writes credentials to `~/.aws/credentials` and `~/.aws/config` (`-p` flag)
+6. Writes credentials to `~/.aws/credentials` and `~/.aws/config` under a profile named after the account (use `-p name` to override)
