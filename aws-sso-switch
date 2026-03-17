@@ -186,9 +186,8 @@ def get_credentials(token, account_id, role_name, region):
 
 
 def make_profile_name(acct_name, role_name):
-    """Generate a sanitized profile name from account + role."""
-    raw = f"{acct_name}-{role_name}"
-    return re.sub(r"[^a-zA-Z0-9_-]", "-", raw).lower().strip("-")
+    """Generate a sanitized profile name from account name."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", acct_name).lower().strip("-")
 
 
 def save_to_profile(profile_name, creds, acct_name, acct_id, role_name, region):
@@ -264,9 +263,9 @@ def main():
         "-p", "--save-profile",
         nargs="?",
         const="",
-        default=None,
+        default="",
         metavar="PROFILE_NAME",
-        help="Save credentials as a named AWS profile (auto-named if no name given)",
+        help="Save credentials as a named AWS profile (default: account name; pass a value to override)",
     )
     args = parser.parse_args()
 
