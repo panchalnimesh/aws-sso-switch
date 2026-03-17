@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+AWS SSO Account Switcher
+Dynamically discovers all accessible accounts/roles via SSO token
+and lets you switch using fzf — no profile pre-configuration needed.
+
+Usage (in your shell):
+  eval "$(aws-sso-switch)"          # interactive fzf picker
+  eval "$(aws-sso-switch -l)"       # list all accounts/roles
+  eval "$(aws-sso-switch -s prod)"  # use specific sso-session name
+  eval "$(aws-sso-switch -f word)"  # pre-filter by keyword
+  eval "$(aws-sso-switch -p)"       # save selection as auto-named profile
+  eval "$(aws-sso-switch -p myname)"# save selection as profile 'myname'
+"""
+
+import json
+import os
+import re
+import sys
+import subprocess
+import glob
+import argparse
+from datetime import datetime, timezone
+from pathlib import Path
+import configparser
+
+SSO_CACHE_DIR = Path.home() / ".aws" / "sso" / "cache"
+AWS_CONFIG = Path.home() / ".aws" / "config"
+
+
+def get_sso_sessions():
+    """Parse all sso-sessions from ~/.aws/config"""
+    config = configparser.ConfigParser()
+    config.read(AWS_CONFIG)
+    sessions = {}
+    for section in config.sections():
+        if section.startswith("sso-session "):
+            name = section.replace("sso-session ", "")
+            sessions[name] = {
+                "start_url": config[section].get("sso_start_url", ""),
+                "region": config[section].get("sso_region", "ap-southeast-1"),
+            }
+    return sessions
+
+
+def get_valid_token(start_url_filter=None):
+    """Find the best (latest-expiring) valid SSO access token from cache."""
+    best = None
+    best_expiry = None
+
+    for cache_file in SSO_CACHE_DIR.glob("*.json"):
+        if cache_file.suffix == ".tmp":
+            continue
+        try:
+            with open(cache_file) as f:
+                data = json.load(f)
+
+            if "accessToken" not in data:
+                continue
+
+            raw = data.get("expiresAt", "")
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            expiry = datetime.fromisoformat(raw)
+            now = datetime.now(timezone.utc)
+
+            if expiry <= now:
+                continue
+
+            if start_url_filter:
+                url = data.get("startUrl", "")
+                if start_url_filter not in url:
+                    continue
+
+            if best_expiry is None or expiry > best_expiry:
+                best = data
+                best_expiry = expiry
+
+        except Exception:
+            continue
+
+    if best:
+        return best["accessToken"], best.get("startUrl", ""), best.get("region", "ap-southeast-1")
+    return None, None, None
+
+
+def aws_sso_cmd(cmd_args, region):
+    """Run an AWS SSO CLI command."""
+    result = subprocess.run(
+        ["aws"] + cmd_args + ["--region", region, "--output", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def paginate_sso(cmd_args, key, region):
+    """Paginate through AWS SSO results."""
+    items = []
+    next_token = None
+    while True:
+        args = cmd_args[:]
+        if next_token:
+            args += ["--next-token", next_token]
+        data = aws_sso_cmd(args, region)
+        if not data:
+            break
+        items.extend(data.get(key, []))
+        next_token = data.get("nextToken")
+        if not next_token:
+            break
+    return items
+
+
+def list_all_accounts_roles(token, region):
+    """Return list of (account_name, account_id, role_name) tuples."""
+    print("Fetching SSO accounts...", file=sys.stderr, end="", flush=True)
+
+    accounts = paginate_sso(
+        ["sso", "list-accounts", "--access-token", token],
+        "accountList",
+        region,
+    )
+
+    if not accounts:
+        return []
+
+    entries = []
+    for account in sorted(accounts, key=lambda x: x.get("accountName", "").lower()):
+        acct_id = account["accountId"]
+        acct_name = account.get("accountName", acct_id)
+        print(".", file=sys.stderr, end="", flush=True)
+
+        roles = paginate_sso(
+            ["sso", "list-account-roles", "--access-token", token, "--account-id", acct_id],
+            "roleList",
+            region,
+        )
+        for role in roles:
+            entries.append((acct_name, acct_id, role["roleName"]))
+
+    print(" done", file=sys.stderr)
+    return entries
+
+
+def fzf_select(items, query=""):
+    """Interactive selection via fzf."""
+    text = "\n".join(items)
+    cmd = [
+        "fzf",
+        "--prompt", "AWS Account/Role > ",
+        "--height", "50%",
+        "--reverse",
+        "--border",
+        "--ansi",
+        "--header", "CTRL-C to cancel | Enter to select",
+    ]
+    if query:
+        cmd += ["--query", query]
+
+    result = subprocess.run(cmd, input=text, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def get_credentials(token, account_id, role_name, region):
+    """Fetch temporary credentials for given account/role."""
+    data = aws_sso_cmd(
+        [
+            "sso", "get-role-credentials",
+            "--access-token", token,
+            "--account-id", account_id,
+            "--role-name", role_name,
+        ],
+        region,
+    )
+    if data:
+        return data.get("roleCredentials")
+    return None
+
+
+def make_profile_name(acct_name, role_name):
+    """Generate a sanitized profile name from account + role."""
+    raw = f"{acct_name}-{role_name}"
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", raw).lower().strip("-")
+
+
+def save_to_profile(profile_name, creds, acct_name, acct_id, role_name, region):
+    """Write credentials and config to ~/.aws/credentials and ~/.aws/config."""
+    creds_path = Path.home() / ".aws" / "credentials"
+    config_path = Path.home() / ".aws" / "config"
+
+    # Update ~/.aws/credentials
+    creds_cfg = configparser.ConfigParser()
+    creds_cfg.read(creds_path)
+    if profile_name not in creds_cfg:
+        creds_cfg[profile_name] = {}
+    creds_cfg[profile_name]["aws_access_key_id"] = creds["accessKeyId"]
+    creds_cfg[profile_name]["aws_secret_access_key"] = creds["secretAccessKey"]
+    creds_cfg[profile_name]["aws_session_token"] = creds["sessionToken"]
+    creds_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(creds_path, "w") as f:
+        creds_cfg.write(f)
+
+    # Update ~/.aws/config
+    config_cfg = configparser.ConfigParser()
+    config_cfg.read(config_path)
+    section = f"profile {profile_name}"
+    if section not in config_cfg:
+        config_cfg[section] = {}
+    config_cfg[section]["region"] = region
+    config_cfg[section]["output"] = "json"
+    config_cfg[section]["x_account_name"] = acct_name
+    config_cfg[section]["x_account_id"] = acct_id
+    config_cfg[section]["x_role_name"] = role_name
+    with open(config_path, "w") as f:
+        config_cfg.write(f)
+
+
+def emit_exports(creds, acct_name, acct_id, role_name, region, save_profile=None):
+    """Print shell export statements to stdout for eval."""
+    profile_name = None
+    if save_profile is not None:
+        profile_name = save_profile if save_profile else make_profile_name(acct_name, role_name)
+        save_to_profile(profile_name, creds, acct_name, acct_id, role_name, region)
+
+    lines = [
+        f'export AWS_ACCESS_KEY_ID="{creds["accessKeyId"]}"',
+        f'export AWS_SECRET_ACCESS_KEY="{creds["secretAccessKey"]}"',
+        f'export AWS_SESSION_TOKEN="{creds["sessionToken"]}"',
+        f'export AWS_DEFAULT_REGION="{region}"',
+        f'export AWS_ACCOUNT_ID="{acct_id}"',
+        f'export AWS_ACCOUNT_NAME="{acct_name}"',
+        f'export AWS_ROLE_NAME="{role_name}"',
+    ]
+
+    if profile_name:
+        lines += [
+            f'export AWS_PROFILE="{profile_name}"',
+            f'echo "Switched to: {acct_name} ({acct_id}) [{role_name}] — saved as profile \'{profile_name}\'"',
+        ]
+    else:
+        lines += [
+            f'unset AWS_PROFILE',
+            f'echo "Switched to: {acct_name} ({acct_id}) [{role_name}]"',
+        ]
+
+    print("\n".join(lines))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AWS SSO account switcher")
+    parser.add_argument("-s", "--session", help="SSO session name from ~/.aws/config")
+    parser.add_argument("-f", "--filter", help="Pre-filter accounts by keyword", default="")
+    parser.add_argument("-l", "--list", action="store_true", help="List all accounts/roles without switching")
+    parser.add_argument("-r", "--region", help="Override default region for session", default="")
+    parser.add_argument(
+        "-p", "--save-profile",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PROFILE_NAME",
+        help="Save credentials as a named AWS profile (auto-named if no name given)",
+    )
+    args = parser.parse_args()
+
+    # Determine start URL filter from session name
+    start_url_filter = None
+    default_region = args.region or "ap-southeast-1"
+
+    if args.session:
+        sessions = get_sso_sessions()
+        if args.session not in sessions:
+            available = ", ".join(sessions.keys()) or "none found"
+            print(f'echo "ERROR: SSO session \'{args.session}\' not found. Available: {available}"')
+            sys.exit(1)
+        start_url_filter = sessions[args.session]["start_url"]
+        if not args.region:
+            default_region = sessions[args.session]["region"]
+
+    # Get valid token
+    token, start_url, token_region = get_valid_token(start_url_filter)
+
+    if not token:
+        sessions = get_sso_sessions()
+        session_names = list(sessions.keys())
+        hint = ""
+        if session_names:
+            hint = f"  aws sso login --sso-session {session_names[0]}"
+        else:
+            hint = "  aws sso login"
+        print(
+            f'echo "No valid SSO token found. Please login first:\\n{hint}"',
+            file=sys.stdout,
+        )
+        sys.exit(1)
+
+    sso_region = default_region or token_region or "ap-southeast-1"
+
+    # List all accounts and roles
+    entries = list_all_accounts_roles(token, sso_region)
+
+    if not entries:
+        print('echo "No accounts/roles found. Token may be expired — try aws sso login"')
+        sys.exit(1)
+
+    if args.list:
+        for name, acct_id, role in entries:
+            print(f"  {name} ({acct_id}) - {role}")
+        return
+
+    # Build display lines
+    display_entries = [
+        f"{name}  ({acct_id})  [{role}]"
+        for name, acct_id, role in entries
+    ]
+
+    selected = fzf_select(display_entries, query=args.filter)
+    if not selected:
+        sys.exit(0)
+
+    # Find matching entry
+    match = None
+    for display, entry in zip(display_entries, entries):
+        if display == selected:
+            match = entry
+            break
+
+    if not match:
+        print('echo "Selection error"')
+        sys.exit(1)
+
+    acct_name, acct_id, role_name = match
+    creds = get_credentials(token, acct_id, role_name, sso_region)
+
+    if not creds:
+        print(f'echo "Failed to get credentials for {acct_name} ({acct_id}) [{role_name}]"')
+        sys.exit(1)
+
+    emit_exports(creds, acct_name, acct_id, role_name, sso_region, save_profile=args.save_profile)
+
+
+if __name__ == "__main__":
+    main()
